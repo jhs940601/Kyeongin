@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Black+Han+Sans&family=IBM+Plex+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" as="style" crossorigin href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable.css" />
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 :root{
   --pine-deep:#0E2019;
@@ -594,7 +595,11 @@ footer b{color:#fff;}
     { id:"s8", no:"08", type:"station", name:"월볼 피니시", unit:"", desc:"약공을 목표 지점에 맞추고 마지막 400m 결승 러닝으로 이어지는 대회의 클라이맥스 구간.", meta:"30회 + 400m" }
   ];
 
-  var STORAGE_KEY = "gyeongin-hyrox-2026-v1";
+  var SUPABASE_URL = "https://iaatbwckxnxqvadpgvuq.supabase.co";
+  var SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlhYXRid2NreG54cXZhZHBndnVxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM2NjEwMTIsImV4cCI6MjA5OTIzNzAxMn0.E1OIaXS4JbJaeLI1RNBcYZiKTBCXupPP4uP3hdvSdEk";
+  var ROW_ID = "gyeongin-hyrox-2026";
+  var supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
   var DEFAULT_META = {
     eventDate:"2026. 10. 8.(목) 09:00",
     eventDateISO:"2026-10-08T09:00:00",
@@ -602,7 +607,7 @@ footer b{color:#fff;}
     heroSub:"초지일관의 교표 정신과 소나무처럼 꺾이지 않는 끈기로, 24개 학급이 하나의 트랙 위에서 청팀과 백팀으로 맞붙습니다. 달리고, 밀고, 나르며 완주하는 그 자체가 이번 체육대회의 목표입니다."
   };
   var state = { meta: JSON.parse(JSON.stringify(DEFAULT_META)), records: {} };
-  var persistMode = "memory";
+  var persistMode = "connecting";
   var activeStationTab = "overall";
 
   function timeToSec(str){
@@ -618,37 +623,66 @@ footer b{color:#fff;}
     return (m<10?"0":"")+m+":"+(s<10?"0":"")+s;
   }
 
-  /* ---------------- persistence ---------------- */
+  /* ---------------- persistence (Supabase) ---------------- */
+  function applyRemoteRow(row){
+    if(row && row.data){
+      state.meta = Object.assign({}, DEFAULT_META, row.data.meta||{});
+      state.records = row.data.records || {};
+    }
+  }
   async function loadState(){
     try{
-      if(window.storage){
-        var res = await window.storage.get(STORAGE_KEY, true);
-        if(res && res.value){
-          var parsed = JSON.parse(res.value);
-          state.meta = Object.assign({}, DEFAULT_META, parsed.meta||{});
-          state.records = parsed.records || {};
-        }
-        persistMode = "cloud";
-        return;
-      }
-    }catch(e){ persistMode = "cloud"; /* key just not created yet */ }
-    persistMode = "memory";
+      var { data, error } = await supabase
+        .from("tournament_state")
+        .select("data")
+        .eq("id", ROW_ID)
+        .maybeSingle();
+      if(error) throw error;
+      applyRemoteRow(data);
+      persistMode = "cloud";
+    }catch(e){
+      console.error("Supabase load error", e);
+      persistMode = "offline";
+    }
   }
   async function saveState(){
     try{
-      if(window.storage){
-        await window.storage.set(STORAGE_KEY, JSON.stringify(state), true);
-        persistMode = "cloud";
-        return;
-      }
-    }catch(e){}
-    persistMode = "memory";
+      var { error } = await supabase
+        .from("tournament_state")
+        .upsert({ id: ROW_ID, data: { meta: state.meta, records: state.records }, updated_at: new Date().toISOString() });
+      if(error) throw error;
+      persistMode = "cloud";
+    }catch(e){
+      console.error("Supabase save error", e);
+      persistMode = "offline";
+      alert("서버 저장에 실패했습니다. 네트워크 상태를 확인한 뒤 다시 시도해 주세요.");
+    }
+    updateSyncStatus();
   }
   function updateSyncStatus(){
     var el = document.getElementById("sync-status");
     if(!el) return;
-    if(persistMode === "cloud") el.textContent = "🟢 실시간 공유 저장소 연결됨 — 모든 방문자에게 동일한 결과가 표시됩니다";
-    else el.textContent = "⚪ 저장소 연결 대기 중 — 새로고침 시 초기화될 수 있습니다";
+    if(persistMode === "cloud") el.textContent = "🟢 실시간 연결됨 — 모든 방문자에게 동일한 결과가 즉시 반영됩니다";
+    else if(persistMode === "connecting") el.textContent = "⚪ 서버에 연결하는 중…";
+    else el.textContent = "🔴 서버 연결 실패 — 새로고침 후 다시 시도해 주세요";
+  }
+
+  /* ---------------- realtime subscription ---------------- */
+  function subscribeRealtime(){
+    supabase
+      .channel("tournament_state_" + ROW_ID)
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "tournament_state", filter: "id=eq." + ROW_ID },
+        function(payload){
+          applyRemoteRow(payload.new);
+          applyMetaToPage();
+          rebuildAll();
+          fillMetaForm();
+        }
+      )
+      .subscribe(function(status){
+        if(status === "SUBSCRIBED"){ persistMode = "cloud"; updateSyncStatus(); }
+      });
   }
 
   /* ---------------- scoring ---------------- */
@@ -947,29 +981,6 @@ footer b{color:#fff;}
     updateSyncStatus();
   }
 
-  /* ---------------- polling for "live" updates ---------------- */
-  function pollForUpdates(){
-    setInterval(async function(){
-      try{
-        if(window.storage){
-          var res = await window.storage.get(STORAGE_KEY, true);
-          if(res && res.value){
-            var parsed = JSON.parse(res.value);
-            var newStr = JSON.stringify(parsed);
-            var curStr = JSON.stringify(state);
-            if(newStr !== curStr){
-              state.meta = Object.assign({}, DEFAULT_META, parsed.meta||{});
-              state.records = parsed.records || {};
-              applyMetaToPage();
-              rebuildAll();
-              fillMetaForm();
-            }
-          }
-        }
-      }catch(e){}
-    }, 6000);
-  }
-
   /* ---------------- init ---------------- */
   async function init(){
     renderStations();
@@ -978,13 +989,14 @@ footer b{color:#fff;}
     renderWaveTable();
     renderAdminSelects();
     wireAdminActions();
+    updateSyncStatus();
     await loadState();
     applyMetaToPage();
     fillMetaForm();
     startCountdown();
     rebuildAll();
     wireReveal();
-    pollForUpdates();
+    subscribeRealtime();
   }
   init();
 })();
